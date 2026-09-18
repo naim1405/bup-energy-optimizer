@@ -76,9 +76,10 @@ def optimize_energy(
 ) -> OptimizeEnergyResponse:
     """Return the operator-note interpretation and the final 24-hour schedule.
 
-    The schedule is produced by the real optimizer (a linear program over
-    grid, solar, charge, discharge and battery energy). Operator-note
-    interpretation is still stubbed to ``no_op`` for every note, so the plan
-    is optimal for the base scenario but does not yet respond to directives.
+    Operator notes are interpreted by the LLM, then the schedule is produced
+    by the optimizer: a linear program over grid, solar, charge, discharge
+    and battery energy. If interpretation fails for any reason the request
+    still succeeds -- the notes are reported as ``no_op`` and the plan is
+    optimal for the base scenario.
     """
     return optimize_scenario(request)
