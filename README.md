@@ -5,11 +5,13 @@ it receives a 24-hour campus energy scenario plus 1-3 natural-language
 operator notes, and returns an interpretation of those notes along with a
 24-hour operating schedule.
 
-> **Current status — scaffold + mock.** `POST /optimize-energy` accepts the
-> full request contract and returns a **schema-valid mock response**. It does
-> **not** interpret operator notes and does **not** optimize: every note is
-> reported as `no_op`, the battery is left idle, and the plan is not
-> cost-optimal. The LLM layer and the optimizer are not wired in yet.
+> **Current status — optimizer wired in, interpretation stubbed.**
+> `POST /optimize-energy` runs the **real optimizer**: a linear program over
+> grid, solar, charge, discharge and battery energy that minimizes total grid
+> cost subject to every GridWise rule. Operator-note interpretation is still
+> **stubbed to `no_op`** for every note, so the plan is optimal for the base
+> scenario but does not yet respond to directives. Wiring in the LLM means
+> replacing one function — see [Swapping in the LLM](#swapping-in-the-llm).
 
 ## Project structure
 
@@ -19,17 +21,23 @@ bup-energy-optimizer/
 │   ├── main.py                  # app factory, router mounts, 400 error handler
 │   ├── core/
 │   │   └── config.py            # Settings (env vars / .env via pydantic-settings)
+│   ├── engine/                  # the math: pure, framework-free
+│   │   ├── models.py            # dataclasses (Scenario, Directive, HourPlan...)
+│   │   ├── optimizer.py         # directive overlay + LP + post-processing
+│   │   └── validate.py          # independent hour-by-hour rule replay
 │   ├── schemas/
 │   │   ├── common.py            # DirectiveType, BatteryAction enums
 │   │   ├── energy.py            # API request + response models
 │   │   └── llm.py               # LLM structured-output model (LangChain target)
 │   ├── services/
-│   │   └── mock_optimizer.py    # MOCK response builder (replace with real pipeline)
+│   │   └── energy_optimizer.py  # pydantic <-> engine adapter + interpreter stub
 │   └── api/
 │       └── routes/
 │           ├── health.py        # GET  /health
 │           └── optimize.py      # POST /optimize-energy
 ├── tests/
+│   └── fixtures/
+│       └── public_sample_cases.json   # organizer-provided public cases
 ├── pyproject.toml               # deps (uv), incl. langchain + redis
 ├── uv.lock
 ├── Dockerfile
@@ -58,7 +66,7 @@ uv run pytest
 | ------ | ------------------- | -------------------------------------------------------- |
 | GET    | `/`                 | Index with pointers to docs and the endpoints            |
 | GET    | `/health`           | Readiness probe — exactly `{"status":"ok"}`              |
-| POST   | `/optimize-energy`  | Interpretation + 24-hour plan (**mock** at present)      |
+| POST   | `/optimize-energy`  | Interpretation + optimized 24-hour plan                  |
 | GET    | `/docs`             | Swagger UI                                               |
 
 ### `GET /health`
@@ -90,6 +98,12 @@ curl -X POST http://localhost:8000/optimize-energy \
 Response shape: `scenario_id`, `directive_interpretation[]`, `hourly_plan[24]`,
 `total_grid_kwh`, `total_cost_bdt`, `peak_grid_kwh`, `plan_summary`.
 See `/docs` for the full schema and a worked example.
+
+**Note on current costs:** because interpretation is stubbed to `no_op`, the
+returned cost can be *lower* than the published reference for the same case —
+the reference plan obeys directives that restrict the schedule, and we are not
+applying them yet. That is expected, not a bug. Every returned plan is still
+fully valid under the energy rules.
 
 **Status codes**
 
@@ -196,12 +210,106 @@ server {
 Reload nginx (`sudo nginx -t && sudo systemctl reload nginx`) and health-check
 via `curl http://your-domain.com/health`.
 
+## The optimizer
+
+`app/engine/` is deliberately **pure**: no pydantic, no FastAPI, no I/O. It
+takes dataclasses and returns dataclasses, so it can be unit-tested without a
+network — which matters because the LLM call upstream of it may be slow or
+unavailable. `app/services/energy_optimizer.py` adapts between the two worlds.
+
+```
+request (pydantic)
+  -> interpret_notes()                 [STUB: all no_op]
+  -> NoteInterpretation.to_api_model() -> DirectiveInterpretation
+  -> engine Directive
+  -> engine.optimize()                 -> ScheduleResult
+  -> OptimizeEnergyResponse
+```
+
+**Model.** A plain linear program — no integer variables, even though
+`battery_action` looks categorical. Charge and discharge are 1:1 (no
+round-trip loss), so they are modelled as two non-negative continuous
+variables and the action is derived afterwards.
+
+Five variables per hour (120 total): `grid`, `solar`, `charge`, `discharge`,
+`E_after`. Minimize `sum(grid[h] * tariff[h])` subject to:
+
+| Rule | Constraint |
+| ---- | ---------- |
+| Energy balance (9.5) | `grid + solar + discharge - charge = demand` |
+| Battery state (9.1) | `E[h] = E[h-1] + charge - discharge` |
+| End-of-day neutrality (9.6) | `E[23] = initial_energy_kwh` |
+| Solar usage (9.4) | `0 <= solar[h] <= effective_solar[h]` |
+| Battery bounds (9.2) | `min_floor[h] <= E[h] <= capacity` |
+| Rate limits (9.3) | `charge <= max_charge`, `discharge <= max_discharge` |
+| Grid cap | `grid[h] <= grid_cap[h]` |
+
+Solved with scipy's HiGHS binding (~5 ms per request).
+
+**Directives become per-hour arrays** in one place, and only there:
+
+```python
+effective_solar[h] *= factor                 # solar_reduction
+min_floor[h]      = max(min_floor[h], n)     # minimum_battery_reserve
+charge_ok[h]      = False                    # no_charge_window
+discharge_ok[h]   = False                    # no_discharge_window
+grid_cap[h]       = min(grid_cap[h], n)      # max_grid_window
+```
+
+**Post-processing.** Net `charge - discharge` into a single action, round to
+6dp, then *derive* `grid` from the balance equation and *replay* `E` forward.
+Both are computed rather than trusted, so they cannot disagree with the plan
+the judge recalculates from.
+
+**Self-validation.** `app/engine/validate.py` re-implements every rule from
+the problem statement, independently of the optimizer, and runs on our own
+output before it is returned. Violations are logged, never sent to the client.
+
+**Infeasibility.** A misread directive can make the model infeasible even
+though the organizer's ground truth never is. On LP failure the engine
+re-solves with slack variables on the soft directives (grid caps, raised
+reserve floors), so it always returns a structurally valid 24-hour plan,
+sets `feasible=False`, and flags it in `plan_summary`. Never a 500.
+
+## Swapping in the LLM
+
+Everything downstream of `interpret_notes()` is already exercised by the stub.
+Replace that one function in `app/services/energy_optimizer.py`:
+
+```python
+from app.schemas.llm import NoteInterpretationResult
+
+def interpret_notes(notes: list[str]) -> list[NoteInterpretation]:
+    llm = init_chat_model(...).with_structured_output(NoteInterpretationResult)
+    result = llm.invoke(build_messages(notes))     # your prompt goes here
+    return result.interpretations
+```
+
+`app/schemas/llm.py` is the guardrail layer: it validates the model's output
+and `to_api_model()` derives `applies` and the adjustment shape rather than
+trusting them. Remember the output is untrusted — catch `ValidationError`,
+retry once, then fall back to a `no_op` entry for any note that still fails.
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+137 tests across four suites:
+
+| File | Covers |
+| ---- | ------ |
+| `test_engine.py` | All 10 public cases: the engine reproduces every published optimum exactly, passes an independent rule replay, and reports self-consistent totals. |
+| `test_engine_edges.py` | Infeasibility fallback, the reconcile/repair path, each directive honoured in isolation, stacked directives, and 120 random unseen scenarios cross-checked against a second LP algorithm. |
+| `test_integration.py` | HTTP end-to-end, including directives injected by monkeypatching `interpret_notes` to prove they travel the whole path. |
+| `test_optimize.py`, `test_llm_schema.py`, `test_health.py` | Contract shape, invalid-input handling, schema coupling. |
+
+`tests/fixtures/public_sample_cases.json` is the organizer-provided public
+pack, vendored so the suite is self-contained.
+
 ## Roadmap
 
-- **LLM interpretation** — `app/schemas/llm.py` is ready; add an `app/llm/`
-  module with the prompt, the LangChain call, and the guardrail/fallback chain.
-- **Optimizer** — replace `app/services/mock_optimizer.py` with the real
-  24-hour scheduler (an LP over grid / solar / charge / discharge / energy).
-- **Self-validation** — replay the finished plan against the energy rules
-  before returning it.
+- **LLM interpretation** — replace `interpret_notes()`; add the prompt and the
+  retry/fallback chain.
 - **Job queue** — backend will be Redis (`redis` already a dependency).

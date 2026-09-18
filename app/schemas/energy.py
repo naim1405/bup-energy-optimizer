@@ -12,7 +12,14 @@ from __future__ import annotations
 
 from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_serializer,
+    model_validator,
+)
 
 from app.schemas.common import (
     HOURS_PER_DAY,
@@ -125,11 +132,19 @@ class StructuredAdjustment(BaseModel):
     def _normalize_hours(cls, v: list[int]) -> list[int]:
         if not v:
             raise ValueError("hours must not be empty")
-        out = sorted(set(v))
-        if len(out) != len(v):
-            # Duplicates are tolerated on the way in but must not be emitted.
-            return out
-        return out
+        return sorted(set(v))
+
+    @model_serializer
+    def _drop_unused_fields(self) -> dict:
+        """Emit only the keys this directive type actually uses.
+
+        The contract requires an exact shape per type -- the published
+        reference for a reserve is ``{"hours": [...], "minimum_energy_kwh": n}``
+        with no ``"factor": null`` riding along. `response_model_exclude_none`
+        is not an option here because `no_op` genuinely needs
+        ``structured_adjustment: null`` at the parent level.
+        """
+        return {k: v for k, v in self.__dict__.items() if v is not None}
 
 
 class DirectiveInterpretation(BaseModel):

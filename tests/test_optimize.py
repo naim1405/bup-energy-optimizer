@@ -114,8 +114,8 @@ def test_totals_match_the_returned_plan() -> None:
     )
 
 
-def test_mock_plan_satisfies_the_energy_rules() -> None:
-    """The mock is not optimal, but it must still be a VALID schedule."""
+def test_returned_plan_satisfies_the_energy_rules() -> None:
+    """Whatever the optimizer does, the schedule must obey the GridWise rules."""
     req = make_request()
     body = post(req).json()
     plan = {p["hour"]: p for p in body["hourly_plan"]}

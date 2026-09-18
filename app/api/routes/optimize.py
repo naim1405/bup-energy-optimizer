@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, status
 
 from app.schemas.energy import OptimizeEnergyRequest, OptimizeEnergyResponse
-from app.services.mock_optimizer import build_mock_response
+from app.services.energy_optimizer import optimize_scenario
 
 router = APIRouter(tags=["optimize"])
 
@@ -76,8 +76,9 @@ def optimize_energy(
 ) -> OptimizeEnergyResponse:
     """Return the operator-note interpretation and the final 24-hour schedule.
 
-    NOTE: the body is a stub. It currently returns a mock plan and reports
-    every note as ``no_op``. The LLM interpretation layer and the optimizer
-    are not wired in yet.
+    The schedule is produced by the real optimizer (a linear program over
+    grid, solar, charge, discharge and battery energy). Operator-note
+    interpretation is still stubbed to ``no_op`` for every note, so the plan
+    is optimal for the base scenario but does not yet respond to directives.
     """
-    return build_mock_response(request)
+    return optimize_scenario(request)

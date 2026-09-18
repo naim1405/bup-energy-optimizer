@@ -48,11 +48,13 @@ def test_hours_are_deduped_and_sorted() -> None:
 
 
 def test_window_directives_carry_no_stray_numeric_fields() -> None:
+    """A no_discharge_window adjustment is hours-only -- no null riders."""
     adj = NoteInterpretation(
         note_index=0, applies=True, directive_type="no_discharge_window", hours=[18, 19]
     ).to_api_model(CAPACITY).structured_adjustment
-    assert adj.model_dump() == {"hours": [18, 19], "factor": None,
-                                "minimum_energy_kwh": None, "max_grid_kwh": None}
+    assert adj.model_dump() == {"hours": [18, 19]}
+    assert adj.factor is None and adj.minimum_energy_kwh is None
+    assert adj.max_grid_kwh is None
 
 
 @pytest.mark.parametrize(

@@ -9,6 +9,9 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "pydantic>=2.7",
     "pydantic-settings>=2.4",
+    # Optimization engine (app/engine): LP solved with scipy's HiGHS binding.
+    "numpy>=1.26",
+    "scipy>=1.11",
     # Reserved for the upcoming LLM layer — dependency only, no code yet.
     "langchain>=0.3",
     # Reserved for the upcoming job queue — dependency only, no code yet.
