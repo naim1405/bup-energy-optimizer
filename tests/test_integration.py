@@ -1,10 +1,16 @@
 """End-to-end integration: HTTP request -> engine -> HTTP response.
 
-The interpreter is still the no_op stub, so these tests check the plumbing
-rather than language understanding. ``test_directive_flows_end_to_end``
-monkeypatches the stub to prove a real directive travels the whole path
-(LLM-shaped output -> to_api_model -> engine Directive -> LP -> response),
-which is the part that has to keep working when the model is wired in.
+These tests check the plumbing, not language understanding. ``conftest.py``
+removes the API key for every test, so the interpreter deterministically
+falls back to ``no_op`` here -- which is what makes the "no directives"
+assertions below meaningful rather than environment-dependent. The
+``*_flows_end_to_end`` tests then monkeypatch ``interpret_notes`` to prove a
+real directive travels the whole path (LLM-shaped output -> ``to_api_model``
+-> engine Directive -> LP -> response).
+
+Language understanding itself is covered by ``tests/test_llm.py`` with fake
+LLMs and measured against the real model by
+``scripts/eval_interpretation.py``.
 """
 
 from __future__ import annotations
@@ -38,7 +44,7 @@ def idle_baseline_cost(case: dict) -> float:
 
 
 # ---------------------------------------------------------------------------
-# The stubbed path: valid and optimized for the base scenario
+# The no-directive path: valid and optimized for the base scenario
 # ---------------------------------------------------------------------------
 
 
@@ -74,14 +80,24 @@ def test_endpoint_returns_a_valid_schedule(cases, case_id) -> None:
 
 @pytest.mark.parametrize("case_id", ["SAMPLE-01", "SAMPLE-05", "SAMPLE-09"])
 def test_endpoint_beats_the_do_nothing_baseline(cases, case_id) -> None:
+    """With no directives in force, optimizing must beat an idle battery.
+
+    Only valid on the no-directive path: a directive such as a solar
+    reduction legitimately costs MORE than doing nothing, because it takes
+    away cheap solar the optimizer would otherwise have used.
+    """
     case = cases[case_id]
     body = client.post("/optimize-energy", json=case["input"]).json()
     assert body["total_cost_bdt"] < idle_baseline_cost(case) - TOL
 
 
 @pytest.mark.parametrize("case_id", ["SAMPLE-01", "SAMPLE-05", "SAMPLE-09"])
-def test_stubbed_cost_equals_the_no_directive_optimum(cases, case_id) -> None:
-    """The endpoint must return exactly what the engine computes, no drift."""
+def test_endpoint_cost_equals_the_no_directive_optimum(cases, case_id) -> None:
+    """No drift between the endpoint and the engine it wraps.
+
+    Interpretation is pinned to no_op by conftest, so the endpoint and a
+    direct engine call over the same scenario must agree exactly.
+    """
     case = cases[case_id]
     request = energy_optimizer.OptimizeEnergyRequest(**case["input"])
     scenario = energy_optimizer.to_scenario(request, [])
@@ -100,14 +116,22 @@ def test_battery_is_actually_used(cases) -> None:
     assert "charge" in actions and "discharge" in actions
 
 
-def test_every_note_still_reported_as_no_op(cases) -> None:
+def test_every_note_reported_once_in_order(cases) -> None:
+    """Section 5.1 shape, checked with interpretation pinned to no_op.
+
+    The count and ordering must survive regardless of how the notes are
+    read: one entry per note, in note_index order, never skipped and never
+    duplicated. And a no_op entry must carry applies=false with a null
+    adjustment -- the one combination the contract allows.
+    """
     entries = client.post(
         "/optimize-energy", json=cases["SAMPLE-06"]["input"]
     ).json()["directive_interpretation"]
     assert [e["note_index"] for e in entries] == [0, 1, 2]
-    assert all(e["applies"] is False for e in entries)
-    assert all(e["directive_type"] == "no_op" for e in entries)
-    assert all(e["structured_adjustment"] is None for e in entries)
+    for e in entries:
+        assert e["directive_type"] == "no_op"
+        assert e["applies"] is False
+        assert e["structured_adjustment"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -224,8 +248,16 @@ def test_impossible_directive_still_returns_200(monkeypatch, cases) -> None:
     assert all(p["grid_kwh"] >= 0 for p in body["hourly_plan"])
 
 
-def test_request_latency_is_well_inside_the_budget(cases) -> None:
-    """The guide requires p95 <= 5s; the LP alone should take milliseconds."""
+def test_engine_path_latency_is_well_inside_the_budget(cases) -> None:
+    """Everything except the LLM call must be effectively free.
+
+    With the key removed by conftest, interpretation short-circuits to
+    no_op, so this measures schema validation + LP + assembly on its own.
+    A second here would mean the optimizer, not the model, is the
+    bottleneck. The full request including a live model call is budgeted at
+    p95 <= 5s and is measured by scripts/eval_interpretation.py; it is not
+    asserted here because a test must not depend on the network.
+    """
     import time
 
     t0 = time.perf_counter()

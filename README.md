@@ -353,15 +353,37 @@ docker run -p 8000:8000 -e OPENAI_API_KEY -e LLM_MODEL=gpt-4o-mini bup-energy-op
 uv run pytest
 ```
 
-161 tests across seven suites:
+174 tests across eight suites:
 
 | File | Covers |
 | ---- | ------ |
 | `test_engine.py` | All 10 public cases: the engine reproduces every published optimum exactly, passes an independent rule replay, and reports self-consistent totals. |
 | `test_engine_edges.py` | Infeasibility fallback, the reconcile/repair path, each directive honoured in isolation, stacked directives, and 120 random unseen scenarios cross-checked against a second LP algorithm. |
 | `test_llm.py` | Prompt content, reconcile behaviour on messy output, every failure path (dead provider, partial result, exhausted budget, missing key), and configuration. No network calls. |
+| `test_llm_schema.py` | Schema coupling and the window-bounds arithmetic that turns `window_start_hour`/`window_end_hour` into an hour list. |
 | `test_integration.py` | HTTP end-to-end, including directives injected at the interpreter seam to prove they travel the whole path. |
-| `test_optimize.py`, `test_llm_schema.py`, `test_health.py` | Contract shape, invalid-input handling, schema coupling. |
+| `test_optimize.py`, `test_health.py` | Contract shape, invalid-input handling, health probe. |
+| `test_hermeticity.py` | Asserts no API key is visible to tests and that interpretation falls back without a network call. |
+
+**The suite never touches the network.** `Settings` loads `.env`, so a key in
+your environment used to send the integration tests down the live-model path
+while a clean checkout ran them down the no-key fallback -- the same suite
+passed in one environment and failed in the other. `tests/conftest.py` now
+removes the key from both the process environment and the settings singleton
+for every test, so interpretation deterministically falls back to `no_op`
+and the whole suite runs in about three seconds either way.
+`test_the_suite_is_hermetic` fails loudly if that guarantee is ever removed.
+
+Language understanding is therefore *not* measured by `pytest`. Use the
+evaluation harness for that:
+
+```bash
+OPENAI_API_KEY=... uv run python scripts/eval_interpretation.py            # public pack
+OPENAI_API_KEY=... uv run python scripts/eval_interpretation.py --paraphrase
+```
+
+It scores the four judged rubric dimensions per note against the public pack
+plus 12 reworded notes, and prints latency against the 5s p95 budget.
 
 `tests/fixtures/public_sample_cases.json` is the organizer-provided public
 pack, vendored so the suite is self-contained.
