@@ -1,0 +1,27 @@
+[project]
+name = "bup-energy-optimizer"
+version = "0.1.0"
+description = "FastAPI backend for the BUP energy optimizer"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "pydantic-settings>=2.4",
+    # Reserved for the upcoming LLM layer — dependency only, no code yet.
+    "langchain>=0.3",
+    # Reserved for the upcoming job queue — dependency only, no code yet.
+    "redis>=5.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
