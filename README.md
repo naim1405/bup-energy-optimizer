@@ -1,27 +1,48 @@
 # BUP Energy Optimizer
 
-A minimal, modular **FastAPI** backend for the BUP energy optimizer.
-Currently it exposes a single `/health` endpoint. Dependencies for the
-planned LLM layer (`langchain`) and job queue (`redis`) are already declared
-but intentionally have no code behind them yet.
+A modular **FastAPI** backend for the BUP CSE Fest 2026 GridWise challenge:
+it receives a 24-hour campus energy scenario plus 1-3 natural-language
+operator notes, and returns an interpretation of those notes along with a
+24-hour operating schedule.
+
+> **Current status — full pipeline wired.** `POST /optimize-energy`
+> interprets operator notes with **gpt-4o-mini via LangChain**, validates the
+> structured output, applies it as hard constraints, and returns an optimized
+> 24-hour schedule from a linear program. If the model is unavailable the
+> service degrades to `no_op` for every note and still returns a valid plan.
 
 ## Project structure
 
 ```
 bup-energy-optimizer/
 ├── app/
-│   ├── main.py                 # FastAPI app factory + entry point
+│   ├── main.py                  # app factory, router mounts, 400 error handler
 │   ├── core/
-│   │   └── config.py           # Settings (env vars / .env via pydantic-settings)
+│   │   └── config.py            # Settings (env vars / .env via pydantic-settings)
+│   ├── llm/
+│   │   ├── prompts.py           # system prompt + message builder
+│   │   └── interpreter.py       # LangChain client, retry, safe fallback
+│   ├── engine/                  # the math: pure, framework-free
+│   │   ├── models.py            # dataclasses (Scenario, Directive, HourPlan...)
+│   │   ├── optimizer.py         # directive overlay + LP + post-processing
+│   │   └── validate.py          # independent hour-by-hour rule replay
+│   ├── schemas/
+│   │   ├── common.py            # DirectiveType, BatteryAction enums
+│   │   ├── energy.py            # API request + response models
+│   │   └── llm.py               # LLM structured-output model (LangChain target)
+│   ├── services/
+│   │   └── energy_optimizer.py  # pydantic <-> engine adapter (pipeline glue)
 │   └── api/
 │       └── routes/
-│           └── health.py       # GET /health
+│           ├── health.py        # GET  /health
+│           └── optimize.py      # POST /optimize-energy
 ├── tests/
-│   └── test_health.py
-├── pyproject.toml              # deps (uv), incl. langchain + redis
-├── uv.lock                     # locked dependency versions
+│   └── fixtures/
+│       └── public_sample_cases.json   # organizer-provided public cases
+├── pyproject.toml               # deps (uv), incl. langchain + redis
+├── uv.lock
 ├── Dockerfile
-├── docker-compose.yml          # api + redis
+├── docker-compose.yml           # api + redis
 └── .env.example
 ```
 
@@ -31,6 +52,7 @@ bup-energy-optimizer/
 uv sync                # install pinned dependencies
 uv run uvicorn app.main:app --reload
 # → http://localhost:8000/health
+# → http://localhost:8000/docs
 ```
 
 Run the tests:
@@ -41,11 +63,107 @@ uv run pytest
 
 ## Endpoints
 
-| Method | Path      | Description                                  |
-| ------ | --------- | -------------------------------------------- |
-| GET    | `/`       | Index with pointers to docs and health       |
-| GET    | `/health` | Liveness/readiness probe (`{"status":"ok"}`) |
-| GET    | `/docs`   | Swagger UI                                   |
+| Method | Path                | Description                                              |
+| ------ | ------------------- | -------------------------------------------------------- |
+| GET    | `/`                 | Index with pointers to docs and the endpoints            |
+| GET    | `/health`           | Readiness probe — exactly `{"status":"ok"}`              |
+| POST   | `/optimize-energy`  | Interpretation + optimized 24-hour plan                  |
+| GET    | `/docs`             | Swagger UI                                               |
+
+### `GET /health`
+
+Returns exactly `{"status": "ok"}`. Service name and version are deliberately
+not in this body so a strict equality check passes; they are still available at
+`/` and in the OpenAPI document.
+
+```bash
+curl http://localhost:8000/health
+# {"status":"ok"}
+```
+
+### `POST /optimize-energy`
+
+```bash
+curl -X POST http://localhost:8000/optimize-energy \
+     -H 'Content-Type: application/json' \
+     -d '{
+           "scenario_id": "GRID-101",
+           "operator_notes": ["Solar output will drop to about 20% from 1 PM to 3 PM."],
+           "hours": [ {"hour":0,"demand_kwh":180,"solar_kwh":0,"tariff_bdt_per_kwh":7}, ... 23 more ... ],
+           "battery": {"capacity_kwh":500,"initial_energy_kwh":200,
+                       "minimum_energy_kwh":50,"max_charge_kwh_per_hour":100,
+                       "max_discharge_kwh_per_hour":100}
+         }'
+```
+
+Response shape: `scenario_id`, `directive_interpretation[]`, `hourly_plan[24]`,
+`total_grid_kwh`, `total_cost_bdt`, `peak_grid_kwh`, `plan_summary`.
+See `/docs` for the full schema and a worked example.
+
+**Note on current costs:** because interpretation is stubbed to `no_op`, the
+returned cost can be *lower* than the published reference for the same case —
+the reference plan obeys directives that restrict the schedule, and we are not
+applying them yet. That is expected, not a bug. Every returned plan is still
+fully valid under the energy rules.
+
+**Status codes**
+
+| Code | Meaning                                                        |
+| ---- | -------------------------------------------------------------- |
+| 200  | Successful response                                            |
+| 400  | Malformed JSON or structurally invalid request                 |
+
+Request validation errors are mapped to **400** rather than FastAPI's default
+422, matching the problem statement's status-code table. The error body
+contains only `loc` / `msg` / `type` — no stack traces or internals.
+
+## Schemas
+
+`app/schemas/energy.py` holds the API contract. Input models use
+`extra="ignore"` so an unexpected metadata field cannot cause a 400; output
+models use `extra="forbid"` so the service can never emit a field outside the
+contract.
+
+Two rules are enforced by validators rather than left to callers:
+
+- **`applies` is derived from `directive_type`** — `no_op` is the only type
+  permitted with `applies=false` and a `null` adjustment, so an inconsistent
+  pair cannot be constructed.
+- **`structured_adjustment` must match its directive type** — `solar_reduction`
+  requires `factor` (0-1), `minimum_battery_reserve` requires
+  `minimum_energy_kwh`, `max_grid_window` requires `max_grid_kwh`, and the
+  window directives take `hours` only.
+
+### LLM structured output (`app/schemas/llm.py`)
+
+`NoteInterpretationResult` is the model to hand to LangChain:
+
+```python
+from app.schemas.llm import NoteInterpretationResult
+
+llm = init_chat_model(...).with_structured_output(NoteInterpretationResult)
+result = llm.invoke(messages)                    # -> NoteInterpretationResult
+entries = [i.to_api_model(battery.capacity_kwh)
+           for i in result.interpretations]      # -> list[DirectiveInterpretation]
+```
+
+Design notes:
+
+- The per-note model is **flat** — nested optional objects are harder for
+  models to fill reliably, and a flat schema lets the per-type required field
+  be checked by a validator.
+- The `Field(description=...)` strings end up in the JSON schema the model
+  sees, so they act as prompt guidance. The two most commonly misread rules
+  (`factor` is the fraction **remaining**, and hour windows are
+  **end-exclusive**) are spelled out there.
+- `reserve_percent_of_capacity` handles notes like *"keep at least 50% of the
+  battery capacity"*. `to_api_model(capacity)` resolves it to absolute kWh,
+  which is what the response contract requires.
+- LLM output is untrusted. A `ValidationError` here is the signal to retry
+  once and then fall back to `no_op` — never let one bad note fail a request.
+
+**Not implemented yet:** the prompt, the LangChain call, the guardrail/fallback
+chain, and the optimizer.
 
 ## Docker
 
@@ -56,8 +174,7 @@ docker build -t bup-energy-optimizer .
 docker run -p 8000:8000 bup-energy-optimizer
 ```
 
-The app **listens on 0.0.0.0:8000** inside the container and exposes port
-8000, so on the host it is reachable at `http://localhost:8000`.
+The app listens on `0.0.0.0:8000` inside the container and exposes port 8000.
 
 ### Option B — full stack (API + Redis) via docker compose
 
@@ -65,14 +182,12 @@ The app **listens on 0.0.0.0:8000** inside the container and exposes port
 docker compose up --build -d
 ```
 
-This starts `api` on `8000` and `redis` on `6379`. `redis` is wired in now
-(ready for the future queue) but is not required for `/health` to work.
+Starts `api` on `8000` and `redis` on `6379`. Redis is wired in for the future
+queue but is not required for either endpoint.
 
 > **BuildKit note:** the Dockerfile deliberately avoids BuildKit-only features
 > (no `RUN --mount`), so it also builds with the classic builder on hosts
-> without the `buildx` plugin. If `docker compose` prints a "requires buildx
-> plugin" warning, it is harmless — or enable BuildKit anyway with
-> `sudo pacman -S docker-buildx` (Arch Linux).
+> without the `buildx` plugin.
 
 ## Nginx reverse proxy (port forwarding)
 
@@ -96,9 +211,185 @@ server {
 Reload nginx (`sudo nginx -t && sudo systemctl reload nginx`) and health-check
 via `curl http://your-domain.com/health`.
 
+## The optimizer
+
+`app/engine/` is deliberately **pure**: no pydantic, no FastAPI, no I/O. It
+takes dataclasses and returns dataclasses, so it can be unit-tested without a
+network — which matters because the LLM call upstream of it may be slow or
+unavailable. `app/services/energy_optimizer.py` adapts between the two worlds.
+
+```
+request (pydantic)
+  -> interpret_notes()                 [app/llm: gpt-4o-mini]
+  -> NoteInterpretation.to_api_model() -> DirectiveInterpretation
+  -> engine Directive
+  -> engine.optimize()                 -> ScheduleResult
+  -> OptimizeEnergyResponse
+```
+
+**Model.** A plain linear program — no integer variables, even though
+`battery_action` looks categorical. Charge and discharge are 1:1 (no
+round-trip loss), so they are modelled as two non-negative continuous
+variables and the action is derived afterwards.
+
+Five variables per hour (120 total): `grid`, `solar`, `charge`, `discharge`,
+`E_after`. Minimize `sum(grid[h] * tariff[h])` subject to:
+
+| Rule | Constraint |
+| ---- | ---------- |
+| Energy balance (9.5) | `grid + solar + discharge - charge = demand` |
+| Battery state (9.1) | `E[h] = E[h-1] + charge - discharge` |
+| End-of-day neutrality (9.6) | `E[23] = initial_energy_kwh` |
+| Solar usage (9.4) | `0 <= solar[h] <= effective_solar[h]` |
+| Battery bounds (9.2) | `min_floor[h] <= E[h] <= capacity` |
+| Rate limits (9.3) | `charge <= max_charge`, `discharge <= max_discharge` |
+| Grid cap | `grid[h] <= grid_cap[h]` |
+
+Solved with scipy's HiGHS binding (~5 ms per request).
+
+**Directives become per-hour arrays** in one place, and only there:
+
+```python
+effective_solar[h] *= factor                 # solar_reduction
+min_floor[h]      = max(min_floor[h], n)     # minimum_battery_reserve
+charge_ok[h]      = False                    # no_charge_window
+discharge_ok[h]   = False                    # no_discharge_window
+grid_cap[h]       = min(grid_cap[h], n)      # max_grid_window
+```
+
+**Post-processing.** Net `charge - discharge` into a single action, round to
+6dp, then *derive* `grid` from the balance equation and *replay* `E` forward.
+Both are computed rather than trusted, so they cannot disagree with the plan
+the judge recalculates from.
+
+**Self-validation.** `app/engine/validate.py` re-implements every rule from
+the problem statement, independently of the optimizer, and runs on our own
+output before it is returned. Violations are logged, never sent to the client.
+
+**Infeasibility.** A misread directive can make the model infeasible even
+though the organizer's ground truth never is. On LP failure the engine
+re-solves with slack variables on the soft directives (grid caps, raised
+reserve floors), so it always returns a structurally valid 24-hour plan,
+sets `feasible=False`, and flags it in `plan_summary`. Never a 500.
+
+## LLM layer
+
+`app/llm/` is where the language model lives. It is the only place a model is
+constructed or called.
+
+```python
+from langchain_openai import ChatOpenAI
+
+ChatOpenAI(model=settings.llm_model, temperature=0.0, ...).with_structured_output(
+    NoteInterpretationResult
+)
+```
+
+`NoteInterpretationResult` (in `app/schemas/llm.py`) is the structured-output
+schema. Its field descriptions are part of the prompt the model sees, which is
+why the two most commonly misread rules live there as well as in the system
+prompt:
+
+- **`factor` is the fraction REMAINING.** An 80% reduction means 0.2.
+- **Hour windows are end-exclusive.** "1 PM to 3 PM" means `[13, 14]`.
+
+All notes go in **one** call rather than one per note — p95 latency is scored,
+and three sequential round-trips would be the largest avoidable cost.
+
+### Model output is untrusted
+
+`reconcile()` forces whatever comes back into exactly one entry per note:
+missing indices are filled with `no_op`, out-of-range indices and duplicates
+are dropped, and plain dicts are validated. `to_api_model()` then *derives*
+`applies` and the adjustment shape rather than trusting them, so an
+inconsistent model answer cannot produce a response that breaks the contract.
+
+### Failure handling
+
+The interpreter never raises:
+
+| Situation | Behaviour |
+| --------- | --------- |
+| Provider error / timeout | log, retry once |
+| Incomplete result (covers 1 of 3 notes) | log, retry once |
+| Retry also fails | return the best partial result |
+| Nothing usable at all | `no_op` for every note |
+| Time budget exhausted | stop retrying |
+
+The budget (`LLM_BUDGET_SECONDS`, default 24s) exists so a hung provider
+cannot eat the judge's 30s per-request limit. Verified: with **no API key
+configured at all**, the service still boots, `/health` returns 200, and
+`/optimize-energy` returns a valid schedule in about a second.
+
+## Configuration
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `OPENAI_API_KEY` | — | Standard OpenAI key. Without it the service still runs; notes fall back to `no_op`. |
+| `LLM_MODEL` | `gpt-4o-mini` | Model name. Swap it without a code change. |
+| `LLM_TEMPERATURE` | `0.0` | Deterministic extraction. |
+| `LLM_TIMEOUT_SECONDS` | `8` | Per-call timeout. |
+| `LLM_MAX_RETRIES` | `1` | Provider-level retries. |
+| `LLM_BUDGET_SECONDS` | `24` | Hard ceiling for the interpretation step. |
+| `REDIS_URL` | `redis://localhost:6379/0` | Reserved for the future queue. |
+
+Set them in a local `.env` (see `.env.example`) or in the environment. The key
+is held as a `SecretStr`, so it is never printed, logged, or serialized. It is
+passed to the client explicitly rather than relying on the SDK's environment
+lookup, which means a `.env` file alone is enough to configure the service.
+
+**Never bake the key into the image.** `.dockerignore` excludes `.env`, and
+`docker-compose.yml` forwards the key from the host at runtime:
+
+```bash
+OPENAI_API_KEY=sk-... docker compose up --build -d
+# or
+docker run -p 8000:8000 -e OPENAI_API_KEY -e LLM_MODEL=gpt-4o-mini bup-energy-optimizer
+```
+
+## Tests
+
+```bash
+uv run pytest
+```
+
+174 tests across eight suites:
+
+| File | Covers |
+| ---- | ------ |
+| `test_engine.py` | All 10 public cases: the engine reproduces every published optimum exactly, passes an independent rule replay, and reports self-consistent totals. |
+| `test_engine_edges.py` | Infeasibility fallback, the reconcile/repair path, each directive honoured in isolation, stacked directives, and 120 random unseen scenarios cross-checked against a second LP algorithm. |
+| `test_llm.py` | Prompt content, reconcile behaviour on messy output, every failure path (dead provider, partial result, exhausted budget, missing key), and configuration. No network calls. |
+| `test_llm_schema.py` | Schema coupling and the window-bounds arithmetic that turns `window_start_hour`/`window_end_hour` into an hour list. |
+| `test_integration.py` | HTTP end-to-end, including directives injected at the interpreter seam to prove they travel the whole path. |
+| `test_optimize.py`, `test_health.py` | Contract shape, invalid-input handling, health probe. |
+| `test_hermeticity.py` | Asserts no API key is visible to tests and that interpretation falls back without a network call. |
+
+**The suite never touches the network.** `Settings` loads `.env`, so a key in
+your environment used to send the integration tests down the live-model path
+while a clean checkout ran them down the no-key fallback -- the same suite
+passed in one environment and failed in the other. `tests/conftest.py` now
+removes the key from both the process environment and the settings singleton
+for every test, so interpretation deterministically falls back to `no_op`
+and the whole suite runs in about three seconds either way.
+`test_the_suite_is_hermetic` fails loudly if that guarantee is ever removed.
+
+Language understanding is therefore *not* measured by `pytest`. Use the
+evaluation harness for that:
+
+```bash
+OPENAI_API_KEY=... uv run python scripts/eval_interpretation.py            # public pack
+OPENAI_API_KEY=... uv run python scripts/eval_interpretation.py --paraphrase
+```
+
+It scores the four judged rubric dimensions per note against the public pack
+plus 12 reworded notes, and prints latency against the 5s p95 budget.
+
+`tests/fixtures/public_sample_cases.json` is the organizer-provided public
+pack, vendored so the suite is self-contained.
+
 ## Roadmap
 
-- **LLM integration** — `langchain` is in `pyproject.toml`; add an `app/llm/`
-  module when ready.
-- **Job queue** — backend will be Redis (`redis` already a dependency); add a
-  queue module (e.g. RQ / Celery / arq) when ready.
+- **Interpretation tuning** — measure against paraphrased notes and tighten the
+  few-shot examples where the model still misreads windows or factors.
+- **Job queue** — backend will be Redis (`redis` already a dependency).
