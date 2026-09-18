@@ -68,6 +68,12 @@ docker compose up --build -d
 This starts `api` on `8000` and `redis` on `6379`. `redis` is wired in now
 (ready for the future queue) but is not required for `/health` to work.
 
+> **BuildKit note:** the Dockerfile deliberately avoids BuildKit-only features
+> (no `RUN --mount`), so it also builds with the classic builder on hosts
+> without the `buildx` plugin. If `docker compose` prints a "requires buildx
+> plugin" warning, it is harmless — or enable BuildKit anyway with
+> `sudo pacman -S docker-buildx` (Arch Linux).
+
 ## Nginx reverse proxy (port forwarding)
 
 Deploy the container so it publishes port `8000`, then point nginx at it:

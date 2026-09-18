@@ -14,8 +14,7 @@ WORKDIR /app
 # Install pinned dependencies first (better layer caching; pyproject/uv.lock
 # change far less often than the app source).
 COPY pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev --no-install-project
+RUN uv sync --frozen --no-dev --no-install-project
 
 # Application source
 COPY app ./app
