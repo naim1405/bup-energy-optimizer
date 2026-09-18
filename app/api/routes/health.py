@@ -14,4 +14,6 @@ def health() -> dict:
         "status": "ok",
         "service": settings.app_name,
         "version": settings.version,
+        "auto_deploy": "working",
     }
+

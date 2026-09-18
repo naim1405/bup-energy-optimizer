@@ -20,7 +20,9 @@ app.include_router(health.router)
 def root() -> dict:
     """Simple index with pointers to the health endpoint and docs."""
     return {
-        "message": settings.app_name,
+        "message": f"Welcome to {settings.app_name}! 🚀 Auto-Deploy is LIVE",
+        "deployment": "Automated via GitHub Actions + Watchtower",
         "health": "/health",
         "docs": "/docs",
     }
+
