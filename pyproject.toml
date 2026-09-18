@@ -12,8 +12,9 @@ dependencies = [
     # Optimization engine (app/engine): LP solved with scipy's HiGHS binding.
     "numpy>=1.26",
     "scipy>=1.11",
-    # Reserved for the upcoming LLM layer — dependency only, no code yet.
-    "langchain>=0.3",
+    # LLM layer (app/llm): operator-note interpretation.
+    "langchain>=1.0",
+    "langchain-openai>=1.0",
     # Reserved for the upcoming job queue — dependency only, no code yet.
     "redis>=5.0",
 ]

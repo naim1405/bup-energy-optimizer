@@ -120,7 +120,8 @@ def test_directive_flows_end_to_end(monkeypatch, cases) -> None:
     case = cases["SAMPLE-03"]          # reserve 100 kWh during hours 18-20
     capacity = case["input"]["battery"]["capacity_kwh"]
 
-    def fake_interpret(notes):
+    def fake_interpret(notes, battery_capacity_kwh):
+        assert battery_capacity_kwh == capacity, "capacity must reach the interpreter"
         return [
             NoteInterpretation(
                 note_index=0,
@@ -156,7 +157,7 @@ def test_solar_reduction_flows_end_to_end(monkeypatch, cases) -> None:
     monkeypatch.setattr(
         energy_optimizer,
         "interpret_notes",
-        lambda notes: [
+        lambda notes, capacity_kwh: [
             NoteInterpretation(
                 note_index=0, applies=True, directive_type="solar_reduction",
                 hours=[11, 12, 13], factor=0.2, explanation="inverter work",
@@ -183,7 +184,7 @@ def test_max_grid_cap_flows_end_to_end(monkeypatch, cases) -> None:
     monkeypatch.setattr(
         energy_optimizer,
         "interpret_notes",
-        lambda notes: [
+        lambda notes, capacity_kwh: [
             NoteInterpretation(
                 note_index=0, applies=True, directive_type="max_grid_window",
                 hours=[18, 19, 20], max_grid_kwh=155, explanation="feeder limit",
@@ -208,7 +209,7 @@ def test_impossible_directive_still_returns_200(monkeypatch, cases) -> None:
     monkeypatch.setattr(
         energy_optimizer,
         "interpret_notes",
-        lambda notes: [
+        lambda notes, capacity_kwh: [
             NoteInterpretation(
                 note_index=0, applies=True, directive_type="max_grid_window",
                 hours=[18, 19, 20], max_grid_kwh=1.0, explanation="absurd cap",

@@ -3,26 +3,34 @@
 Pipeline::
 
     request (pydantic)
-      -> interpret_notes()                 [STUB: all no_op]
+      -> interpret_notes()                 [app/llm, gpt-4o-mini]
       -> NoteInterpretation.to_api_model() -> DirectiveInterpretation
       -> engine Directive
       -> engine.optimize()                 -> ScheduleResult
       -> OptimizeEnergyResponse
 
-The only function that will change when the LLM lands is
-:func:`interpret_notes`. Everything downstream of it -- including the
-``to_api_model`` projection, the engine call and the response assembly -- is
-already being exercised by the stub, so swapping in a real model should not
-require touching any other file.
+Everything downstream of interpretation -- the ``to_api_model`` projection,
+the engine call and the response assembly -- is unchanged by which model
+produces the directives. Tests inject a fake at this seam.
 """
 
 from __future__ import annotations
 
 import logging
 
-from app.engine.models import Directive
+from app.engine.models import (
+    ROUND_DP,
+    BatterySpec,
+    Directive,
+    HourInput,
+    Scenario,
+    ScheduleResult,
+)
 from app.engine.optimizer import optimize
 from app.engine.validate import make_validator
+# Imported by name so tests can monkeypatch
+# ``app.services.energy_optimizer.interpret_notes`` without touching app/llm.
+from app.llm.interpreter import interpret_notes
 from app.schemas.common import DirectiveType
 from app.schemas.energy import (
     DirectiveInterpretation,
@@ -30,14 +38,6 @@ from app.schemas.energy import (
     OptimizeEnergyRequest,
     OptimizeEnergyResponse,
 )
-from app.engine.models import (
-    ROUND_DP,
-    BatterySpec,
-    HourInput,
-    Scenario,
-    ScheduleResult,
-)
-from app.schemas.llm import NoteInterpretation
 
 logger = logging.getLogger(__name__)
 
@@ -51,36 +51,7 @@ _SUMMARY_BY_TYPE = {
 
 
 # ===========================================================================
-# Step 1 -- interpretation  (STUB; the LLM replaces this function only)
-# ===========================================================================
-
-
-def interpret_notes(notes: list[str]) -> list[NoteInterpretation]:
-    """Return one interpretation per operator note.
-
-    STUB IMPLEMENTATION. Every note is reported as ``no_op`` because no
-    language model is wired in yet. The real version will build a prompt from
-    ``notes`` plus the battery/scenario context, call
-    ``with_structured_output(NoteInterpretationResult)``, and return
-    ``result.interpretations``.
-
-    When you replace this, remember the output is untrusted: catch
-    ``ValidationError``, retry once, and fall back to a ``no_op`` entry for
-    any note that still fails -- never let one bad note fail the request.
-    """
-    return [
-        NoteInterpretation(
-            note_index=i,
-            applies=False,
-            directive_type=DirectiveType.NO_OP,
-            explanation="Interpretation is stubbed; no language model is wired in yet.",
-        )
-        for i in range(len(notes))
-    ]
-
-
-# ===========================================================================
-# Step 2 -- adapt pydantic <-> engine dataclasses
+# Adapt pydantic <-> engine dataclasses
 # ===========================================================================
 
 
@@ -126,7 +97,7 @@ def to_scenario(
 
 
 # ===========================================================================
-# Step 3 -- response assembly
+# Response assembly
 # ===========================================================================
 
 
@@ -198,8 +169,9 @@ def optimize_scenario(request: OptimizeEnergyRequest) -> OptimizeEnergyResponse:
     closed (``extra="forbid"``) and the judge recalculates everything from
     ``hourly_plan`` anyway.
     """
-    notes = interpret_notes(request.operator_notes)
-    entries = [n.to_api_model(request.battery.capacity_kwh) for n in notes]
+    capacity = request.battery.capacity_kwh
+    notes = interpret_notes(request.operator_notes, capacity)
+    entries = [n.to_api_model(capacity) for n in notes]
 
     scenario = to_scenario(request, entries)
     result = optimize(scenario, validate_fn=make_validator())

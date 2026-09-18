@@ -5,13 +5,11 @@ it receives a 24-hour campus energy scenario plus 1-3 natural-language
 operator notes, and returns an interpretation of those notes along with a
 24-hour operating schedule.
 
-> **Current status — optimizer wired in, interpretation stubbed.**
-> `POST /optimize-energy` runs the **real optimizer**: a linear program over
-> grid, solar, charge, discharge and battery energy that minimizes total grid
-> cost subject to every GridWise rule. Operator-note interpretation is still
-> **stubbed to `no_op`** for every note, so the plan is optimal for the base
-> scenario but does not yet respond to directives. Wiring in the LLM means
-> replacing one function — see [Swapping in the LLM](#swapping-in-the-llm).
+> **Current status — full pipeline wired.** `POST /optimize-energy`
+> interprets operator notes with **gpt-4o-mini via LangChain**, validates the
+> structured output, applies it as hard constraints, and returns an optimized
+> 24-hour schedule from a linear program. If the model is unavailable the
+> service degrades to `no_op` for every note and still returns a valid plan.
 
 ## Project structure
 
@@ -21,6 +19,9 @@ bup-energy-optimizer/
 │   ├── main.py                  # app factory, router mounts, 400 error handler
 │   ├── core/
 │   │   └── config.py            # Settings (env vars / .env via pydantic-settings)
+│   ├── llm/
+│   │   ├── prompts.py           # system prompt + message builder
+│   │   └── interpreter.py       # LangChain client, retry, safe fallback
 │   ├── engine/                  # the math: pure, framework-free
 │   │   ├── models.py            # dataclasses (Scenario, Directive, HourPlan...)
 │   │   ├── optimizer.py         # directive overlay + LP + post-processing
@@ -30,7 +31,7 @@ bup-energy-optimizer/
 │   │   ├── energy.py            # API request + response models
 │   │   └── llm.py               # LLM structured-output model (LangChain target)
 │   ├── services/
-│   │   └── energy_optimizer.py  # pydantic <-> engine adapter + interpreter stub
+│   │   └── energy_optimizer.py  # pydantic <-> engine adapter (pipeline glue)
 │   └── api/
 │       └── routes/
 │           ├── health.py        # GET  /health
@@ -219,7 +220,7 @@ unavailable. `app/services/energy_optimizer.py` adapts between the two worlds.
 
 ```
 request (pydantic)
-  -> interpret_notes()                 [STUB: all no_op]
+  -> interpret_notes()                 [app/llm: gpt-4o-mini]
   -> NoteInterpretation.to_api_model() -> DirectiveInterpretation
   -> engine Directive
   -> engine.optimize()                 -> ScheduleResult
@@ -271,24 +272,80 @@ re-solves with slack variables on the soft directives (grid caps, raised
 reserve floors), so it always returns a structurally valid 24-hour plan,
 sets `feasible=False`, and flags it in `plan_summary`. Never a 500.
 
-## Swapping in the LLM
+## LLM layer
 
-Everything downstream of `interpret_notes()` is already exercised by the stub.
-Replace that one function in `app/services/energy_optimizer.py`:
+`app/llm/` is where the language model lives. It is the only place a model is
+constructed or called.
 
 ```python
-from app.schemas.llm import NoteInterpretationResult
+from langchain_openai import ChatOpenAI
 
-def interpret_notes(notes: list[str]) -> list[NoteInterpretation]:
-    llm = init_chat_model(...).with_structured_output(NoteInterpretationResult)
-    result = llm.invoke(build_messages(notes))     # your prompt goes here
-    return result.interpretations
+ChatOpenAI(model=settings.llm_model, temperature=0.0, ...).with_structured_output(
+    NoteInterpretationResult
+)
 ```
 
-`app/schemas/llm.py` is the guardrail layer: it validates the model's output
-and `to_api_model()` derives `applies` and the adjustment shape rather than
-trusting them. Remember the output is untrusted — catch `ValidationError`,
-retry once, then fall back to a `no_op` entry for any note that still fails.
+`NoteInterpretationResult` (in `app/schemas/llm.py`) is the structured-output
+schema. Its field descriptions are part of the prompt the model sees, which is
+why the two most commonly misread rules live there as well as in the system
+prompt:
+
+- **`factor` is the fraction REMAINING.** An 80% reduction means 0.2.
+- **Hour windows are end-exclusive.** "1 PM to 3 PM" means `[13, 14]`.
+
+All notes go in **one** call rather than one per note — p95 latency is scored,
+and three sequential round-trips would be the largest avoidable cost.
+
+### Model output is untrusted
+
+`reconcile()` forces whatever comes back into exactly one entry per note:
+missing indices are filled with `no_op`, out-of-range indices and duplicates
+are dropped, and plain dicts are validated. `to_api_model()` then *derives*
+`applies` and the adjustment shape rather than trusting them, so an
+inconsistent model answer cannot produce a response that breaks the contract.
+
+### Failure handling
+
+The interpreter never raises:
+
+| Situation | Behaviour |
+| --------- | --------- |
+| Provider error / timeout | log, retry once |
+| Incomplete result (covers 1 of 3 notes) | log, retry once |
+| Retry also fails | return the best partial result |
+| Nothing usable at all | `no_op` for every note |
+| Time budget exhausted | stop retrying |
+
+The budget (`LLM_BUDGET_SECONDS`, default 24s) exists so a hung provider
+cannot eat the judge's 30s per-request limit. Verified: with **no API key
+configured at all**, the service still boots, `/health` returns 200, and
+`/optimize-energy` returns a valid schedule in about a second.
+
+## Configuration
+
+| Variable | Default | Purpose |
+| -------- | ------- | ------- |
+| `OPENAI_API_KEY` | — | Standard OpenAI key. Without it the service still runs; notes fall back to `no_op`. |
+| `LLM_MODEL` | `gpt-4o-mini` | Model name. Swap it without a code change. |
+| `LLM_TEMPERATURE` | `0.0` | Deterministic extraction. |
+| `LLM_TIMEOUT_SECONDS` | `8` | Per-call timeout. |
+| `LLM_MAX_RETRIES` | `1` | Provider-level retries. |
+| `LLM_BUDGET_SECONDS` | `24` | Hard ceiling for the interpretation step. |
+| `REDIS_URL` | `redis://localhost:6379/0` | Reserved for the future queue. |
+
+Set them in a local `.env` (see `.env.example`) or in the environment. The key
+is held as a `SecretStr`, so it is never printed, logged, or serialized. It is
+passed to the client explicitly rather than relying on the SDK's environment
+lookup, which means a `.env` file alone is enough to configure the service.
+
+**Never bake the key into the image.** `.dockerignore` excludes `.env`, and
+`docker-compose.yml` forwards the key from the host at runtime:
+
+```bash
+OPENAI_API_KEY=sk-... docker compose up --build -d
+# or
+docker run -p 8000:8000 -e OPENAI_API_KEY -e LLM_MODEL=gpt-4o-mini bup-energy-optimizer
+```
 
 ## Tests
 
@@ -296,13 +353,14 @@ retry once, then fall back to a `no_op` entry for any note that still fails.
 uv run pytest
 ```
 
-137 tests across four suites:
+161 tests across seven suites:
 
 | File | Covers |
 | ---- | ------ |
 | `test_engine.py` | All 10 public cases: the engine reproduces every published optimum exactly, passes an independent rule replay, and reports self-consistent totals. |
 | `test_engine_edges.py` | Infeasibility fallback, the reconcile/repair path, each directive honoured in isolation, stacked directives, and 120 random unseen scenarios cross-checked against a second LP algorithm. |
-| `test_integration.py` | HTTP end-to-end, including directives injected by monkeypatching `interpret_notes` to prove they travel the whole path. |
+| `test_llm.py` | Prompt content, reconcile behaviour on messy output, every failure path (dead provider, partial result, exhausted budget, missing key), and configuration. No network calls. |
+| `test_integration.py` | HTTP end-to-end, including directives injected at the interpreter seam to prove they travel the whole path. |
 | `test_optimize.py`, `test_llm_schema.py`, `test_health.py` | Contract shape, invalid-input handling, schema coupling. |
 
 `tests/fixtures/public_sample_cases.json` is the organizer-provided public
@@ -310,6 +368,6 @@ pack, vendored so the suite is self-contained.
 
 ## Roadmap
 
-- **LLM interpretation** — replace `interpret_notes()`; add the prompt and the
-  retry/fallback chain.
+- **Interpretation tuning** — measure against paraphrased notes and tighten the
+  few-shot examples where the model still misreads windows or factors.
 - **Job queue** — backend will be Redis (`redis` already a dependency).
