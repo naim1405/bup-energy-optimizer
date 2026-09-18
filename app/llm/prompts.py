@@ -44,11 +44,32 @@ Use exactly one of these six per note. Never invent another type.
 
 # Rules you must follow
 
-1. Time windows are start-inclusive and END-EXCLUSIVE. "1 PM to 3 PM" means
-   hours [13, 14] -- not [13, 14, 15]. "6 PM until 9 PM" means [18, 19, 20].
-2. For solar_reduction, `factor` is the usable fraction that REMAINS, not the
-   amount lost. An 80% reduction means factor 0.2. "Drops to about 20%" means
-   0.2. "One-fifth of normal" means 0.2. "Cut by three-quarters" means 0.25.
+1. Give every time window as window_start_hour and window_end_hour; leave
+   `hours` empty and it will be filled in for you. Windows are half-open:
+   the start is included, the end is NOT.
+       window_start_hour = the first hour named
+       window_end_hour   = the hour the window stops at (1-24)
+       "1 PM to 3 PM"        -> start 13, end 15  (covers 13, 14)
+       "6 PM until 9 PM"     -> start 18, end 21  (covers 18, 19, 20)
+       "11 AM to 2 PM"       -> start 11, end 14  (covers 11, 12, 13)
+       "6 PM through 10 PM"  -> start 18, end 22  (covers 18, 19, 20, 21)
+       "between 18 and 21"   -> start 18, end 21  (covers 18, 19, 20)
+       "until midnight"      -> end 24
+       "11 PM to 2 AM"       -> start 23, end 2   (wraps; covers 23, 0, 1)
+   "until", "to", "through", "between X and Y" and "from X to Y" all behave
+   the same way; none of them makes the ending hour inclusive. Fill `hours`
+   by hand only for a window that is not a single contiguous run.
+
+2. For solar_reduction, `factor` is the usable fraction that REMAINS, never
+   the amount lost. Read the preposition carefully, it decides everything:
+       "TO x" / "OF normal" / "AT x"  -> factor = x
+       "BY x" / "DOWN BY x" / "LOSS OF x" / "REDUCTION OF x" -> factor = 1 - x
+       "drops to about 20%"      -> 0.2      "drops by 20%"      -> 0.8
+       "one-fifth of normal"     -> 0.2      "falls by two-fifths" -> 0.6
+       "cut by three-quarters"   -> 0.25     "down by a third"   -> 0.667
+       "80% reduction"           -> 0.2      "output at 30%"     -> 0.3
+   When in doubt ask which number is the usable output left over, and report
+   that one.
 3. For minimum_battery_reserve, prefer `minimum_energy_kwh` as an absolute
    kWh figure. If the note gives a percentage of capacity instead, put the
    number in `reserve_percent_of_capacity` (e.g. 50 for "50% of capacity")
@@ -61,31 +82,49 @@ Use exactly one of these six per note. Never invent another type.
 6. Judge each note independently. Do not let one note influence another.
 7. Only use information present in the note. Never invent hours, values, or
    directives that the note does not state.
+8. Charging and discharging get called many things. Charging may be "plug
+   charging", "mains charging", "grid charging", "the charging circuit", "the
+   charger", or "topping up". Discharging may be "feeding the load", "drawing
+   from the pack", or "backup supply". They are still no_charge_window and
+   no_discharge_window.
+9. MAINTENANCE IS NOT A DISTRACTOR. "Isolated", "offline", "out of service",
+   "unavailable", "shut down", "under maintenance" and "being tested" all
+   describe equipment you cannot use. If the equipment is the charger, the
+   battery, the PV array or the grid connection, that IS a directive -- say
+   which window it covers. Only administrative announcements (catering,
+   bookings, staffing, deadlines, unrelated notices) are no_op.
 
 # Examples
 
 Note: "Inverter maintenance will cut PV output by roughly three-quarters
 between 10 and 12."
--> solar_reduction, hours [10, 11], factor 0.25. The window ends at 12 and is
-exclusive, so hour 12 is not included.
+-> solar_reduction, start 10, end 12, factor 0.25. Maintenance on the PV
+equipment is a directive. "Cut by three-quarters" is the amount lost, so the
+fraction remaining is 0.25.
 
 Note: "Keep the pack at no less than 40 percent of its rated capacity from
 19:00 to 22:00 for the drill."
--> minimum_battery_reserve, hours [19, 20, 21], reserve_percent_of_capacity 40.
+-> minimum_battery_reserve, start 19, end 22, reserve_percent_of_capacity 40.
 
-Note: "The charger will be isolated for testing from 06:00 to 08:00."
--> no_charge_window, hours [6, 7].
+Note: "The charger is being isolated for maintenance from 02:00 to 05:00."
+-> no_charge_window, start 2, end 5. The charger is out of service, so it
+cannot charge in that window. Maintenance is the reason, not a distractor.
+
+Note: "The battery bank will be offline for testing from 9 AM until 11 AM."
+-> no_discharge_window, start 9, end 11. An offline battery cannot supply
+the load.
 
 Note: "Feeder work means we cannot pull more than 120 kWh per hour from the
 grid between 5 PM and 7 PM."
--> max_grid_window, hours [17, 18], max_grid_kwh 120.
+-> max_grid_window, start 17, end 19, max_grid_kwh 120.
 
 Note: "Do not let the battery discharge from 8 PM until 10 PM while the relays
 are tested."
--> no_discharge_window, hours [20, 21].
+-> no_discharge_window, start 20, end 22.
 
 Note: "The auditorium booking was moved to Thursday."
--> no_op, applies=false. This does not affect today's energy schedule.
+-> no_op, applies=false. Administrative, and nothing here concerns the
+battery, PV, the grid or charging.
 """
 
 

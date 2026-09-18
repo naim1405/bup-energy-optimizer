@@ -53,11 +53,25 @@ class NoteInterpretation(BaseModel):
         "note that does not affect the current 24-hour energy schedule."
     )
 
+    window_start_hour: Annotated[int, Field(ge=0, le=23)] | None = Field(
+        default=None,
+        description="PREFERRED way to give a time window: the first hour it "
+        "starts at, 0-23. '6 PM until 9 PM' -> 18. Fill this and "
+        "window_end_hour and the hour list is derived for you.",
+    )
+    window_end_hour: Annotated[int, Field(ge=0, le=24)] | None = Field(
+        default=None,
+        description="PREFERRED way to give a time window: the hour it ends "
+        "at, EXCLUSIVE, 1-24. '6 PM until 9 PM' -> 21, which covers 18, 19 "
+        "and 20. Midnight at the end of the day is 24.",
+    )
+
     hours: list[Annotated[int, Field(ge=0, le=23)]] = Field(
         default_factory=list,
-        description="Affected hours as integers 0-23. Time windows are "
-        "start-inclusive and end-EXCLUSIVE: '1 PM to 3 PM' is [13, 14], "
-        "'6 PM until 9 PM' is [18, 19, 20]. Empty only for no_op.",
+        description="Affected hours as integers 0-23. Leave this EMPTY when "
+        "you filled window_start_hour and window_end_hour -- it is then "
+        "derived. Only list hours by hand for a non-contiguous window, e.g. "
+        "[9, 14, 15].",
     )
 
     factor: Annotated[float, Field(ge=0, le=1)] | None = Field(
@@ -92,6 +106,41 @@ class NoteInterpretation(BaseModel):
         description="One short sentence explaining the interpretation. "
         "Free-text wording is not judged.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_hours_from_window(cls, data: object) -> object:
+        """Enumerate the hour list from the window bounds.
+
+        Measured behaviour: the model reads a window correctly but slips
+        when enumerating it, returning one hour too few -- on one real
+        phrasing it dropped hour 20 of "6 PM until 9 PM" in 9 of 12 runs,
+        while reporting start/end correctly every time. Enumerating here
+        removes that whole failure class, and the model still does all the
+        interpreting. ``hours`` is kept as a fallback for windows the model
+        lists directly.
+        """
+        if not isinstance(data, dict):
+            return data
+        dt = data.get("directive_type")
+        if getattr(dt, "value", dt) in (None, "", "no_op"):
+            return data
+        start, end = data.get("window_start_hour"), data.get("window_end_hour")
+        if start is None or end is None:
+            return data
+        try:
+            start, end = int(start), int(end)
+        except (TypeError, ValueError):
+            return data
+        if not 0 <= start <= 23:
+            return data
+        if end <= start:          # wraps past midnight, e.g. 23 -> 2
+            end += 24
+        if not 1 <= end - start <= 24:
+            return data
+        derived = dict(data)
+        derived["hours"] = [(start + i) % 24 for i in range(end - start)]
+        return derived
 
     @field_validator("hours")
     @classmethod

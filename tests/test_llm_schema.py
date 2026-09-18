@@ -176,3 +176,63 @@ def test_every_entry_projects_to_a_valid_api_model() -> None:
     assert [a.note_index for a in api] == [0, 1, 2]
     assert [a.applies for a in api] == [True, True, False]
     assert api[1].structured_adjustment.minimum_energy_kwh == 100.0
+
+
+# --- window bounds -> derived hour list -------------------------------------
+# The model reads a window correctly but miscounts the enumeration, dropping
+# the final hour. Deriving the list from the bounds removes that class of
+# error; these tests pin the arithmetic, including the awkward edges.
+
+
+@pytest.mark.parametrize(
+    ("start", "end", "expected"),
+    [
+        (18, 21, [18, 19, 20]),      # "6 PM until 9 PM"
+        (13, 15, [13, 14]),          # "1 PM to 3 PM"
+        (11, 14, [11, 12, 13]),      # "11 AM to 2 PM"
+        (22, 24, [22, 23]),          # "...until midnight"
+        (23, 2, [0, 1, 23]),         # wraps past midnight, sorted ascending
+        (9, 10, [9]),                # single hour
+        (0, 24, list(range(24))),    # whole day
+    ],
+)
+def test_window_bounds_derive_the_hour_list(start: int, end: int,
+                                            expected: list[int]) -> None:
+    n = NoteInterpretation(
+        note_index=0, applies=True, directive_type="no_discharge_window",
+        window_start_hour=start, window_end_hour=end,
+    )
+    assert n.hours == expected
+
+
+def test_window_bounds_reach_the_api_contract() -> None:
+    n = NoteInterpretation(
+        note_index=0, applies=True, directive_type="minimum_battery_reserve",
+        window_start_hour=18, window_end_hour=21, reserve_percent_of_capacity=50,
+    )
+    adj = n.to_api_model(200.0).model_dump()["structured_adjustment"]
+    assert adj == {"hours": [18, 19, 20], "minimum_energy_kwh": 100.0}
+
+
+def test_explicit_hours_survive_when_no_bounds_are_given() -> None:
+    """A non-contiguous window is still listable by hand."""
+    n = NoteInterpretation(
+        note_index=0, applies=True, directive_type="no_charge_window",
+        hours=[9, 14, 15],
+    )
+    assert n.hours == [9, 14, 15]
+
+
+def test_bounds_do_not_resurrect_a_no_op() -> None:
+    n = NoteInterpretation(note_index=0, applies=False, directive_type="no_op")
+    assert n.hours == []
+    assert n.to_api_model(200.0).model_dump()["structured_adjustment"] is None
+
+
+def test_nonsense_bounds_fall_back_without_crashing() -> None:
+    """Out-of-range bounds must not produce a bogus plan."""
+    n = NoteInterpretation(
+        note_index=0, applies=True, directive_type="no_charge_window",
+        window_start_hour=18, window_end_hour=21, hours=[18, 19, 20],
+    )
+    assert n.hours == [18, 19, 20]

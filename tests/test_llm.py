@@ -233,10 +233,17 @@ def cases_input():
 
 
 def test_prompt_states_the_two_rules_models_get_wrong() -> None:
-    assert "END-EXCLUSIVE" in SYSTEM_PROMPT
-    assert "[13, 14]" in SYSTEM_PROMPT
+    # Windows: half-open, and expressed as bounds rather than a hand-counted
+    # list, because the model enumerates hour lists unreliably.
+    assert "the end is NOT" in SYSTEM_PROMPT
+    assert "window_start_hour" in SYSTEM_PROMPT
+    assert "window_end_hour" in SYSTEM_PROMPT
+    assert "start 18, end 21" in SYSTEM_PROMPT      # covers 18, 19 and 20
+    assert "until midnight" in SYSTEM_PROMPT        # end 24, not 23
+    # Factor: the fraction remaining, not the amount lost.
     assert "REMAINS" in SYSTEM_PROMPT
     assert "factor 0.2" in SYSTEM_PROMPT
+    assert "falls by two-fifths" in SYSTEM_PROMPT   # -> 0.6, the "by" trap
 
 
 def test_prompt_covers_every_directive_type() -> None:
