@@ -353,7 +353,7 @@ docker run -p 8000:8000 -e OPENAI_API_KEY -e LLM_MODEL=gpt-4o-mini bup-energy-op
 uv run pytest
 ```
 
-174 tests across eight suites:
+203 tests across nine suites:
 
 | File | Covers |
 | ---- | ------ |
@@ -364,6 +364,7 @@ uv run pytest
 | `test_integration.py` | HTTP end-to-end, including directives injected at the interpreter seam to prove they travel the whole path. |
 | `test_optimize.py`, `test_health.py` | Contract shape, invalid-input handling, health probe. |
 | `test_hermeticity.py` | Asserts no API key is visible to tests and that interpretation falls back without a network call. |
+| `test_response_numbers.py` | Whole-number floats render as integers and fractional values are untouched, checked field by field against the reference output. |
 
 **The suite never touches the network.** `Settings` loads `.env`, so a key in
 your environment used to send the integration tests down the live-model path
@@ -384,6 +385,15 @@ OPENAI_API_KEY=... uv run python scripts/eval_interpretation.py --paraphrase
 
 It scores the four judged rubric dimensions per note against the public pack
 plus 12 reworded notes, and prints latency against the 5s p95 budget.
+
+### Number formatting
+
+The engine computes in floats, but the published reference output spells
+whole values as integers — `38365`, not `38365.0` — and keeps genuinely
+fractional values as floats. `app/core/response.py` normalises the response
+to match: an exact integer is rendered as one, and nothing else is touched.
+There is no rounding, floor, or ceil, so `152.5` and a `factor` of `0.25`
+come back exactly as computed. This is representation only; no value changes.
 
 `tests/fixtures/public_sample_cases.json` is the organizer-provided public
 pack, vendored so the suite is self-contained.
